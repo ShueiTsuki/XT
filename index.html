@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>XT</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  body { display: flex; align-items: center; justify-content: center; overflow: hidden;
+         -webkit-tap-highlight-color: transparent; cursor: pointer; user-select: none; }
+  #pic { width: 100vw; height: 100vh; object-fit: contain; display: block; }
+  #play { position: fixed; left: 50%; bottom: max(12vh, calc(50vh - 28.125vw - 96px)); width: 72px; height: 72px; margin-left: -36px;
+          border-radius: 50%; background: rgba(0,0,0,.45); transition: opacity .2s; }
+  #play::after { content: ""; position: absolute; left: 29px; top: 22px;
+                 border-style: solid; border-width: 14px 0 14px 22px;
+                 border-color: transparent transparent transparent #fff; }
+  body.playing #play { opacity: 0; }
+  #msg { color: #888; font: 14px/1.5 system-ui, sans-serif; padding: 16px; display: none; }
+</style>
+</head>
+<body>
+<img id="pic" alt="">
+<div id="play" hidden></div>
+<div id="msg"></div>
+<script src="opus-decoder.min.js" charset="UTF-8"></script>
+<script>
+"use strict";
+const ALPHA = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$*+-./:";
+
+function fromBase43(s) {
+  let n = 0n;
+  for (const c of s) {
+    const d = ALPHA.indexOf(c);
+    if (d < 0) throw new Error("bad char " + c);
+    n = n * 43n + BigInt(d);
+  }
+  let hex = n.toString(16);
+  if (hex.length % 2) hex = "0" + hex;
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+function parse(b) {
+  let p = 0;
+  const u8 = () => b[p++];
+  const u16 = () => { const v = b[p] | (b[p + 1] << 8); p += 2; return v; };
+  const varint = () => { let v = 0, s = 0, x; do { x = b[p++]; v |= (x & 127) << s; s += 7; } while (x & 128); return v; };
+  if (u8() !== 1) throw new Error("unknown format");
+  const av1c1 = u8(), w = u16(), h = u16();
+  const n = varint();
+  const image = b.subarray(p, p + n); p += n;
+  const preSkip = u16();
+  const keep = b[p] | (b[p + 1] << 8) | (b[p + 2] << 16); p += 3;
+  const packets = [];
+  while (p < b.length) { const len = varint(); packets.push(b.subarray(p, p + len)); p += len; }
+  return { av1c1, w, h, image, preSkip, keep, packets };
+}
+
+// ---- AVIF (HEIF) container around the AV1 still ----
+function box(type, ...parts) {
+  const body = concat(parts);
+  const out = new Uint8Array(8 + body.length);
+  new DataView(out.buffer).setUint32(0, out.length);
+  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  out.set(body, 8);
+  return out;
+}
+function full(type, version, flags, ...parts) {
+  return box(type, bytes([version, flags >> 16 & 255, flags >> 8 & 255, flags & 255]), ...parts);
+}
+function bytes(a) { return Uint8Array.from(a); }
+function str(s) { return bytes([...s].map(c => c.charCodeAt(0))); }
+function u16be(v) { return bytes([v >> 8 & 255, v & 255]); }
+function u32be(v) { return bytes([v >>> 24 & 255, v >> 16 & 255, v >> 8 & 255, v & 255]); }
+function concat(parts) {
+  const len = parts.reduce((a, x) => a + x.length, 0);
+  const out = new Uint8Array(len); let o = 0;
+  for (const x of parts) { out.set(x, o); o += x.length; }
+  return out;
+}
+function avif(d) {
+  const ftyp = box("ftyp", str("avif"), u32be(0), str("avif"), str("mif1"), str("miaf"));
+  const meta = (offset) => full("meta", 0, 0,
+    full("hdlr", 0, 0, u32be(0), str("pict"), new Uint8Array(12), bytes([0])),
+    full("pitm", 0, 0, u16be(1)),
+    full("iloc", 0, 0, bytes([0x44, 0x00]), u16be(1), u16be(1), u16be(0), u16be(1),
+         u32be(offset), u32be(d.image.length)),
+    full("iinf", 0, 0, u16be(1), full("infe", 2, 0, u16be(1), u16be(0), str("av01"), bytes([0]))),
+    box("iprp",
+      box("ipco",
+        full("ispe", 0, 0, u32be(d.w), u32be(d.h)),
+        box("av1C", bytes([0x81, d.av1c1, 0x0C, 0x00])),
+        full("pixi", 0, 0, bytes([3, 8, 8, 8]))),
+      full("ipma", 0, 0, u32be(1), u16be(1), bytes([3, 0x01, 0x82, 0x03]))));
+  const metaLen = meta(0).length;
+  const offset = ftyp.length + metaLen + 8;
+  return concat([ftyp, meta(offset), box("mdat", d.image)]);
+}
+
+// ---- PCM -> WAV (an <audio> element also plays with the iPhone ring switch on silent) ----
+function wav(pcm, rate) {
+  const n = pcm.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, pcm[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 32768 : s * 32767, true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+async function main() {
+  const hash = decodeURIComponent(location.hash.slice(1)).toUpperCase();
+  const msg = document.getElementById("msg");
+  if (!hash) { msg.textContent = "XT"; msg.style.display = "block"; return; }
+  let d;
+  try { d = parse(fromBase43(hash)); }
+  catch (e) { msg.textContent = "数据不完整"; msg.style.display = "block"; return; }
+
+  const pic = document.getElementById("pic");
+  pic.src = URL.createObjectURL(new Blob([avif(d)], { type: "image/avif" }));
+
+  const dec = new window["opus-decoder"].OpusDecoder({ channels: 1, preSkip: d.preSkip });
+  await dec.ready;
+  const r = dec.decodeFrames(d.packets);
+  dec.free();
+  const pcm = r.channelData[0].subarray(0, Math.min(d.keep, r.samplesDecoded));
+
+  const audio = new Audio(URL.createObjectURL(wav(pcm, r.sampleRate)));
+  const play = document.getElementById("play");
+  play.hidden = false;
+  window.__xt = { audio, samples: pcm.length, rate: r.sampleRate, w: d.w, h: d.h };
+  audio.onended = () => document.body.classList.remove("playing");
+  document.body.addEventListener("click", () => {
+    audio.currentTime = 0;
+    audio.play();
+    document.body.classList.add("playing");
+  });
+}
+main();
+</script>
+</body>
+</html>
