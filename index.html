@@ -113,10 +113,27 @@ function wav(pcm, rate) {
   return new Blob([buf], { type: "audio/wav" });
 }
 
+// No data in the URL: show the original video through bilibili's official embed player.
+const BVID = "BV1fEy8BoEbj";
+const START = 75;       // seconds (01:15)
+function bilibili() {
+  document.getElementById("pic").remove();
+  document.body.style.cursor = "auto";
+  const f = document.createElement("iframe");
+  f.src = "https://player.bilibili.com/player.html?bvid=" + BVID + "&p=1&t=" + START +
+          "&autoplay=1&high_quality=1&danmaku=0";
+  f.allow = "autoplay; fullscreen; encrypted-media; picture-in-picture";
+  f.allowFullscreen = true;
+  f.setAttribute("scrolling", "no");
+  f.setAttribute("frameborder", "0");
+  f.style.cssText = "position:fixed;inset:0;width:100vw;height:100vh;border:0;background:#000";
+  document.body.appendChild(f);
+}
+
 async function main() {
   const hash = decodeURIComponent(location.hash.slice(1)).toUpperCase();
   const msg = document.getElementById("msg");
-  if (!hash) { msg.textContent = "XT"; msg.style.display = "block"; return; }
+  if (!hash) { bilibili(); return; }
   let d;
   try { d = parse(fromBase43(hash)); }
   catch (e) { msg.textContent = "数据不完整"; msg.style.display = "block"; return; }
